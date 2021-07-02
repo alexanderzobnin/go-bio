@@ -122,6 +122,99 @@ func Open(fd uintptr, offset int64, length uintptr, mode Mode, flags Flag) (*Map
 	return m, nil
 }
 
+// OpenFileMapping is a version of Open() which allows to call syscall.CreateFileMapping() with provided file name
+func OpenFileMapping(fd uintptr, offset int64, length uintptr, mode Mode, flags Flag, name *uint16) (*Mapping, error) {
+
+	// Using int64 (off_t) for the offset and uintptr (size_t) for the length
+	// by the reason of the compatibility.
+	if offset < 0 {
+		return nil, ErrBadOffset
+	}
+	if length > uintptr(MaxInt) {
+		return nil, ErrBadLength
+	}
+
+	m := &Mapping{}
+	prot := uint32(syscall.PAGE_READONLY)
+	access := uint32(syscall.FILE_MAP_READ)
+	switch mode {
+	case ModeReadOnly:
+		// NOOP
+	case ModeReadWrite:
+		prot = syscall.PAGE_READWRITE
+		access = syscall.FILE_MAP_WRITE
+		m.writable = true
+	case ModeWriteCopy:
+		prot = syscall.PAGE_WRITECOPY
+		access = syscall.FILE_MAP_COPY
+		m.writable = true
+	default:
+		return nil, ErrBadMode
+	}
+	if flags&FlagExecutable != 0 {
+		prot <<= 4
+		access |= syscall.FILE_MAP_EXECUTE
+		m.executable = true
+	}
+
+	// The separate file handle is needed to avoid errors on the mapped file external closing.
+	var err error
+	m.hProcess, err = syscall.GetCurrentProcess()
+	if err != nil {
+		return nil, os.NewSyscallError("GetCurrentProcess", err)
+	}
+	//err = syscall.DuplicateHandle(
+	//	m.hProcess, syscall.Handle(fd),
+	//	m.hProcess, &m.hFile,
+	//	0, true, syscall.DUPLICATE_SAME_ACCESS,
+	//)
+	//if err != nil {
+	//	return nil, os.NewSyscallError("DuplicateHandle", err)
+	//}
+
+	// The mapping address range must be aligned by the memory page size.
+	pageSize := int64(os.Getpagesize())
+	if pageSize < 0 {
+		return nil, os.NewSyscallError("getpagesize", syscall.EINVAL)
+	}
+	outerOffset := offset / pageSize
+	innerOffset := offset % pageSize
+	m.alignedLength = uintptr(innerOffset) + length
+
+	maxSize := uint64(outerOffset) + uint64(m.alignedLength)
+	maxSizeHigh := uint32(maxSize >> 32)
+	maxSizeLow := uint32(maxSize & uint64(math.MaxUint32))
+	m.hMapping, err = syscall.CreateFileMapping(m.hFile, nil, prot, maxSizeHigh, maxSizeLow, name)
+	if err != nil {
+		return nil, os.NewSyscallError("CreateFileMapping", err)
+	}
+	fileOffset := uint64(outerOffset)
+	fileOffsetHigh := uint32(fileOffset >> 32)
+	fileOffsetLow := uint32(fileOffset & uint64(math.MaxUint32))
+	m.alignedAddress, err = syscall.MapViewOfFile(
+		m.hMapping, access,
+		fileOffsetHigh, fileOffsetLow, m.alignedLength,
+	)
+	if err != nil {
+		return nil, os.NewSyscallError("MapViewOfFile", err)
+	}
+	m.address = m.alignedAddress + uintptr(innerOffset)
+
+	// Wrapping the mapped memory by the byte slice.
+	var sliceHeader struct {
+		data uintptr
+		len  int
+		cap  int
+	}
+	sliceHeader.data = m.address
+	sliceHeader.len = int(length)
+	sliceHeader.cap = sliceHeader.len
+	m.memory = *(*[]byte)(unsafe.Pointer(&sliceHeader))
+
+	runtime.SetFinalizer(m, (*Mapping).Close)
+	return m, nil
+}
+
 // Lock locks the mapped memory pages.
 // All pages that contain a part of the mapping address range
 // are guaranteed to be resident in RAM when the call returns successfully.
